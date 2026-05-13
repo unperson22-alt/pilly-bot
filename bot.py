@@ -1,156 +1,91 @@
-import os
-import logging
-import asyncio
-import urllib.parse
-import httpx
+import os, logging, asyncio, httpx
 from aiohttp import web
+from telegram import Update
+from telegram.ext import Application, MessageHandler, filters, ContextTypes
+import anthropic
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
-REPLICATE_TOKEN  = os.environ.get("REPLICATE_API_TOKEN", "")
+ANTHROPIC_KEY    = os.environ["ANTHROPIC_API_KEY"]
+YOUR_TELEGRAM_ID = int(os.environ["YOUR_TELEGRAM_ID"])
 OFFICE_CHAT_ID   = os.environ.get("OFFICE_CHAT_ID", "")
-HTTP_PORT        = int(os.environ.get("PORT", 8080))
+LOG_BOT_URL      = os.environ.get("LOG_BOT_URL", "")
+HTTP_PORT        = 8080
 
-TG_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+conversation_history = {}
 
+SYSTEM = """Ты помощник для управления AI-офисом. Помогаешь создавать и добавлять новых ботов в систему, отвечаешь четко и профессионально."""
 
-# ── Providers ────────────────────────────────────────────────────────────────
-
-async def _replicate(prompt: str) -> str | None:
-    if not REPLICATE_TOKEN:
-        return None
+async def log(event: str, msg: str):
+    if not LOG_BOT_URL:
+        return
     try:
-        async with httpx.AsyncClient(timeout=90) as c:
-            r = await c.post(
-                "https://api.replicate.com/v1/models/black-forest-labs/flux-schnell/predictions",
-                headers={
-                    "Authorization": f"Bearer {REPLICATE_TOKEN}",
-                    "Content-Type": "application/json",
-                    "Prefer": "wait=60"
-                },
-                json={"input": {"prompt": prompt, "num_outputs": 1, "output_format": "webp"}}
-            )
-            d = r.json()
-            if d.get("status") == "succeeded":
-                logger.info("[pilly] Replicate OK")
-                return d["output"][0]
-            if r.status_code == 402 or "insufficient credit" in str(d.get("error", "")):
-                logger.warning("[pilly] Replicate: no credits → fallback")
-                return None
-            logger.error(f"[pilly] Replicate error: {d.get('error', d.get('status'))}")
-    except Exception as e:
-        logger.error(f"[pilly] Replicate exception: {e}")
-    return None
-
-
-async def _pollinations(prompt: str) -> str | None:
-    try:
-        encoded = urllib.parse.quote(prompt)
-        url = (
-            f"https://image.pollinations.ai/prompt/{encoded}"
-            f"?width=1024&height=1024&nologo=true&enhance=true&seed={hash(prompt) % 99999}"
-        )
-        async with httpx.AsyncClient(timeout=60) as c:
-            r = await c.get(url, follow_redirects=True)
-            if r.status_code == 200 and r.headers.get("content-type", "").startswith("image/"):
-                logger.info("[pilly] Pollinations OK")
-                return url
-    except Exception as e:
-        logger.error(f"[pilly] Pollinations exception: {e}")
-    return None
-
-
-async def generate(prompt: str) -> str | None:
-    """Replicate → Pollinations fallback."""
-    url = await _replicate(prompt)
-    if not url:
-        logger.info("[pilly] trying Pollinations...")
-        url = await _pollinations(prompt)
-    return url
-
-
-# ── Telegram sender ──────────────────────────────────────────────────────────
-
-async def send_photo(chat_id: int, photo_url: str, caption: str) -> bool:
-    try:
-        async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.post(f"{TG_API}/sendPhoto", json={
-                "chat_id": chat_id,
-                "photo": photo_url,
-                "caption": caption
-            })
-            if r.status_code == 200:
-                return True
-            logger.error(f"[pilly] sendPhoto failed: {r.text[:200]}")
-    except Exception as e:
-        logger.error(f"[pilly] sendPhoto exception: {e}")
-    return False
-
-
-async def send_message(chat_id: int, text: str):
-    try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            await c.post(f"{TG_API}/sendMessage", json={
-                "chat_id": chat_id, "text": text
-            })
+        async with httpx.AsyncClient() as c:
+            await c.post(f"{LOG_BOT_URL}/log", json={"agent": "Пилли", "type": event, "message": msg}, timeout=5)
     except Exception:
         pass
 
-
-# ── HTTP handlers ─────────────────────────────────────────────────────────────
-
-async def handle_generate(request: web.Request) -> web.Response:
-    """
-    POST /generate
-    Body: { "prompt": str, "chat_id": int, "requester": str (optional) }
-    """
+async def send_to_group(text: str):
+    if not OFFICE_CHAT_ID:
+        return
     try:
-        data = await request.json()
-        prompt    = data.get("prompt", "").strip()
-        chat_id   = int(data.get("chat_id") or OFFICE_CHAT_ID or 0)
-        requester = data.get("requester", "кто-то")
-
-        if not prompt:
-            return web.json_response({"status": "error", "message": "empty prompt"}, status=400)
-        if not chat_id:
-            return web.json_response({"status": "error", "message": "no chat_id"}, status=400)
-
-        logger.info(f"[pilly] /generate from={requester} chat={chat_id} prompt={prompt[:80]}")
-
-        url = await generate(prompt)
-        if not url:
-            await send_message(chat_id, "❌ Не получилось нарисовать — оба провайдера недоступны")
-            return web.json_response({"status": "error", "message": "generation failed"}, status=500)
-
-        ok = await send_photo(chat_id, url, caption=f"🎨 {prompt}")
-        if ok:
-            return web.json_response({"status": "ok", "url": url})
-        return web.json_response({"status": "error", "message": "send failed"}, status=500)
-
+        async with httpx.AsyncClient() as c:
+            await c.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": OFFICE_CHAT_ID, "text": text}, timeout=10)
     except Exception as e:
-        logger.error(f"[pilly] /generate exception: {e}")
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
+        logger.error(f"send_to_group failed: {e}")
 
+async def process(message: str, user_id: int) -> str:
+    if user_id not in conversation_history:
+        conversation_history[user_id] = []
+    conversation_history[user_id].append({"role": "user", "content": message})
+    if len(conversation_history[user_id]) > 20:
+        conversation_history[user_id] = conversation_history[user_id][-10:]
+    r = client.messages.create(model="claude-sonnet-4-6", max_tokens=1024,
+        system=SYSTEM, messages=conversation_history[user_id])
+    text = r.content[0].text
+    conversation_history[user_id].append({"role": "assistant", "content": text})
+    return text
 
-async def handle_health(request: web.Request) -> web.Response:
-    return web.json_response({"status": "ok", "name": "pilly-bot"})
+async def handle_task(request):
+    data = await request.json()
+    message = data.get("message", "")
+    user_id = data.get("user_id", YOUR_TELEGRAM_ID)
+    await log("MSG_IN", f"[HTTP] {message[:80]}")
+    response = await process(message, user_id)
+    await send_to_group(f"Пилли:\n{response}")
+    await log("MSG_OUT", f"Пилли: {response[:80]}")
+    return web.json_response({"status": "ok", "response": response})
 
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != YOUR_TELEGRAM_ID:
+        return
+    if update.effective_chat.type in ["group", "supergroup"]:
+        return
+    msg = update.message.text
+    await log("MSG_IN", msg[:80])
+    response = await process(msg, update.effective_user.id)
+    await log("MSG_OUT", f"Пилли: {response[:80]}")
+    await update.message.reply_text(response)
 
-# ── Main ─────────────────────────────────────────────────────────────────────
 
 async def main():
-    app = web.Application()
-    app.router.add_post("/generate", handle_generate)
-    app.router.add_get("/health", handle_health)
-
-    runner = web.AppRunner(app)
+    app_http = web.Application()
+    app_http.router.add_post("/task", handle_task)
+    runner = web.AppRunner(app_http)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", HTTP_PORT).start()
-    logger.info(f"🎨 Pilly запущена на :{HTTP_PORT}")
-    await asyncio.Event().wait()
-
+    logger.info(f"HTTP on :{HTTP_PORT}")
+    ptb = Application.builder().token(TELEGRAM_TOKEN).build()
+    ptb.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    async with ptb:
+        await ptb.start()
+        await ptb.updater.start_polling(drop_pending_updates=True)
+        logger.info("Пилли запущен")
+        await asyncio.Event().wait()
 
 if __name__ == "__main__":
     asyncio.run(main())
