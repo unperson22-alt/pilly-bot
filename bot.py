@@ -17,7 +17,7 @@ HTTP_PORT        = 8080
 client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 conversation_history = {}
 
-SYSTEM = """Ты помощник для интеграции в AI-офис, помогаешь автоматизировать задачи и управлять проектами. Отвечай четко и по делу."""
+SYSTEM = """Ты помощник AI-офиса Pilly, который помогает с организацией работы и управлением задачами. Общайся дружелюбно и профессионально, предлагая практические решения."""
 
 async def log(event: str, msg: str):
     if not LOG_BOT_URL:
