@@ -76,15 +76,27 @@ async def generate(prompt: str) -> str | None:
 
 async def send_photo(chat_id: int, photo_url: str, caption: str) -> bool:
     try:
-        async with httpx.AsyncClient(timeout=30) as c:
+        async with httpx.AsyncClient(timeout=60) as c:
+            # Пробуем отправить по URL напрямую
             r = await c.post(f"{TG_API}/sendPhoto", json={
-                "chat_id": chat_id,
-                "photo": photo_url,
-                "caption": caption
+                "chat_id": chat_id, "photo": photo_url, "caption": caption
             })
             if r.status_code == 200:
                 return True
-            logger.error(f"[pilly] sendPhoto failed: {r.text[:200]}")
+            # Telegram не принял URL (напр. Pollinations) — скачиваем и шлём bytes
+            logger.info(f"[pilly] URL rejected ({r.status_code}), downloading...")
+            img = await c.get(photo_url, follow_redirects=True, timeout=60)
+            if img.status_code != 200:
+                logger.error(f"[pilly] download failed: {img.status_code}")
+                return False
+            r2 = await c.post(
+                f"{TG_API}/sendPhoto",
+                data={"chat_id": chat_id, "caption": caption},
+                files={"photo": ("image.jpg", img.content, "image/jpeg")}
+            )
+            if r2.status_code == 200:
+                return True
+            logger.error(f"[pilly] sendPhoto bytes failed: {r2.text[:200]}")
     except Exception as e:
         logger.error(f"[pilly] sendPhoto exception: {e}")
     return False
